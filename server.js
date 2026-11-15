@@ -33,7 +33,7 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.4';
+const VERSION = '0.2.5';
 
 // Deterministic UUIDv5 (RFC 4122) — the platform requires idempotencyKey to
 // be a UUID, and retries must get a byte-identical response, so the key is
@@ -590,6 +590,25 @@ const arenaCache = new Map(); // task_id -> { status, body, signature } (byte-id
 const stealCache = new Map(); // matchId:turn -> { status, body, signature } (byte-identical retries)
 const arenaInflight = new Map(); // task_id -> Promise (a retry during proving waits, never poisons the cache)
 const arenaSeenProofs = new Set(); // normalized proof_tx (in-memory; lost on restart — see README)
+const arenaResults = []; // recent Gatekeeper decisions, newest first (max 64, in-memory; lost on restart) — lets the owner check answers/points-relevant decisions via GET /arena/results, no login needed. No secret, no signature, no raw envelope is stored.
+function recordArenaResult(input, decision, reason, proof, ms) {
+  try {
+    const norm = s => String(s || '').toLowerCase();
+    arenaResults.unshift({
+      time: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta', hour12: false }),
+      task_id: input.task_id,
+      decision, reason_code: reason, proof: Boolean(proof), ms,
+      checks: {
+        vkMatch: Boolean(input.registered_vk && input.proof_vk && norm(input.proof_vk) === norm(input.registered_vk)),
+        thresholdOk: input.public_balance !== null && input.minimum !== null && input.public_balance >= input.minimum,
+        notExpired: input.current_block !== null && input.expiry_block !== null && input.current_block < input.expiry_block,
+        recipientMatch: Boolean(input.recipient && input.condition_recipient && norm(input.recipient) === norm(input.condition_recipient)),
+        amountOk: input.amount !== null && input.max_transfer !== null && input.amount <= input.max_transfer,
+      },
+    });
+    if (arenaResults.length > 64) arenaResults.length = 64;
+  } catch { /* recording must never break the arena response */ }
+}
 
 async function arenaProcess(input) {
   const started = Date.now();
@@ -616,6 +635,7 @@ async function arenaProcess(input) {
   const result = { status: 200, body: respBody, signature: sig };
   arenaCache.set(input.task_id, result);
   log(`ARENA ${input.task_id} ${decision} ${reason} ${Date.now() - started}ms proof=${proof ? 'yes' : 'no'}`);
+  recordArenaResult(input, decision, reason, proof, Date.now() - started);
   return result;
 }
 
@@ -786,6 +806,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/agent') {
       // Some health checks are plain GETs: answer 200, never 4xx.
       return send(res, 200, { ok: true, agent: 'xndr', version: VERSION, arena: { enabled: arenaCircuitsReady(), circuits: arenaCircuitsReady(), secretConfigured: Boolean(arenaSecret()) }, usage: 'POST a signed Gatekeeper task envelope here' });
+    }
+    if (req.method === 'GET' && url.pathname === '/arena/results') {
+      // Owner-visible round log: every Gatekeeper answer (decision, reason, proof, checks) — no login, no secret.
+      return send(res, 200, { agent: 'xndr', version: VERSION, count: arenaResults.length, results: arenaResults });
     }
     if (req.method === 'POST' && (url.pathname === '/agent' || url.pathname === '/')) {
       return handleArena(req, res);
