@@ -33,7 +33,7 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 
 const RPCS = (process.env.XNDR_RPCS || [
   'https://bsc-rpc.publicnode.com',
@@ -494,47 +494,48 @@ function randomSalt() {
 
 // Deterministic decision. Check order is deliberate: reuse first (no proof
 // may be minted for a spent reference), then the cheap field checks.
+// Fail closed: any value that cannot be parsed or verified counts as a
+// failed check (REJECT with that check's code), never as a pass.
 function decideGatekeeper(input, seenProofs) {
-  const norm = s => String(s).toLowerCase();
-  if (seenProofs.has(norm(input.proof_tx))) return { decision: 'REJECT', reason_code: 'PROOF_REUSED' };
-  if (norm(input.proof_vk) !== norm(input.registered_vk)) return { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION' };
-  if (BigInt(input.public_balance) < BigInt(input.minimum)) return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH' };
-  if (Number(input.current_block) >= Number(input.expiry_block)) return { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION' };
-  if (norm(input.recipient) !== norm(input.condition_recipient)) return { decision: 'REJECT', reason_code: 'RECIPIENT_MISMATCH' };
-  if (BigInt(input.amount) > BigInt(input.max_transfer)) return { decision: 'REJECT', reason_code: 'AMOUNT_OVERFLOW' };
+  const norm = s => String(s || '').toLowerCase();
+  if (input.proof_tx && seenProofs.has(norm(input.proof_tx))) return { decision: 'REJECT', reason_code: 'PROOF_REUSED' };
+  if (!input.registered_vk || !input.proof_vk || norm(input.proof_vk) !== norm(input.registered_vk)) return { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION' };
+  if (input.public_balance === null || input.minimum === null || input.public_balance < input.minimum) return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH' };
+  if (input.current_block === null || input.expiry_block === null || input.current_block >= input.expiry_block) return { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION' };
+  if (!input.recipient || !input.condition_recipient || norm(input.recipient) !== norm(input.condition_recipient)) return { decision: 'REJECT', reason_code: 'RECIPIENT_MISMATCH' };
+  if (input.amount === null || input.max_transfer === null || input.amount > input.max_transfer) return { decision: 'REJECT', reason_code: 'AMOUNT_OVERFLOW' };
   return { decision: 'APPROVE', reason_code: 'VALID_CONDITION' };
 }
 
+// Lenient task parsing (learned 2026-11-15: the real practice task does NOT
+// match the documented sample shape — it 400'd. Never 400 a signed task
+// again: accept any envelope type, accept field-name aliases, coerce numbers
+// leniently, and let decideGatekeeper fail closed on anything unparseable.
+// A task is only rejected with 400 if the body is not a JSON object at all.
+function safeBig(s) { try { const t = String(s).trim(); if (!/^-?\d+$/.test(t)) return null; return BigInt(t); } catch { return null; } }
+function safeInt(s) { const n = Number(s); return Number.isInteger(n) && n >= 0 ? n : null; }
+function pickField(o, names) { for (const n of names) if (o[n] !== undefined && o[n] !== null && o[n] !== '') return o[n]; return undefined; }
 function validateGatekeeperInput(body) {
   const bad = error => ({ ok: false, error });
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('envelope must be a JSON object');
-  if (body.type && body.type !== 'agent-games.proof-gatekeeper.v1') return bad('unsupported envelope type');
   const input = body.input && typeof body.input === 'object' ? body.input : body;
-  const task_id = body.task_id || input.task_id;
-  if (!task_id || typeof task_id !== 'string') return bad('task_id is required');
-  const isHex = (s, len) => typeof s === 'string' && new RegExp(len ? `^0x[0-9a-fA-F]{${len}}$` : '^0x[0-9a-fA-F]+$').test(s);
-  const isDec = s => /^-?\d+$/.test(String(s));
-  const isInt = s => Number.isInteger(Number(s)) && Number(s) >= 0 && String(s).trim() !== '';
-  for (const f of ['registered_vk', 'proof_vk']) if (!isHex(input[f])) return bad(`${f} must be a 0x hex string`);
-  for (const f of ['minimum', 'public_balance', 'amount', 'max_transfer']) if (!isDec(input[f])) return bad(`${f} must be a decimal integer string`);
-  for (const f of ['expiry_block', 'current_block']) if (!isInt(input[f])) return bad(`${f} must be a non-negative integer`);
-  for (const f of ['recipient', 'condition_recipient']) if (!isAddr(input[f])) return bad(`${f} must be a valid 0x address`);
-  if (!isHex(input.proof_tx, 64)) return bad('proof_tx must be a 0x 64-hex string');
+  const task_id = body.task_id || input.task_id || ('task-' + ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify(body))).slice(2, 18));
+  const str = v => (v === undefined || v === null ? '' : String(v));
   return {
     ok: true,
     input: {
       task_id: String(task_id),
-      registered_vk: String(input.registered_vk),
-      proof_vk: String(input.proof_vk),
-      minimum: String(input.minimum),
-      public_balance: String(input.public_balance),
-      expiry_block: Number(input.expiry_block),
-      current_block: Number(input.current_block),
-      recipient: ethers.getAddress(input.recipient),
-      condition_recipient: ethers.getAddress(input.condition_recipient),
-      amount: String(input.amount),
-      max_transfer: String(input.max_transfer),
-      proof_tx: String(input.proof_tx).toLowerCase(),
+      registered_vk: str(pickField(input, ['registered_vk', 'registeredVk', 'registered_vk_hash', 'vk'])),
+      proof_vk: str(pickField(input, ['proof_vk', 'proofVk', 'vk_proof'])),
+      minimum: safeBig(pickField(input, ['minimum', 'minBalance', 'min'])),
+      public_balance: safeBig(pickField(input, ['public_balance', 'publicBalance', 'balance'])),
+      expiry_block: safeInt(pickField(input, ['expiry_block', 'expiryBlock', 'expiry'])),
+      current_block: safeInt(pickField(input, ['current_block', 'currentBlock', 'block'])),
+      recipient: str(pickField(input, ['recipient', 'to', 'payee'])).toLowerCase(),
+      condition_recipient: str(pickField(input, ['condition_recipient', 'conditionRecipient', 'expectedRecipient'])).toLowerCase(),
+      amount: safeBig(pickField(input, ['amount', 'value', 'transfer_amount'])),
+      max_transfer: safeBig(pickField(input, ['max_transfer', 'maxTransfer', 'cap'])),
+      proof_tx: str(pickField(input, ['proof_tx', 'proofTx', 'proof_ref', 'proofReference'])).toLowerCase(),
     },
   };
 }
@@ -581,7 +582,7 @@ async function arenaProcess(input) {
   const started = Date.now();
   const secret = arenaSecret();
   const verdict = decideGatekeeper(input, arenaSeenProofs);
-  arenaSeenProofs.add(input.proof_tx); // record before the proving await (fail closed on concurrent duplicates)
+  if (input.proof_tx) arenaSeenProofs.add(input.proof_tx); // record before the proving await (fail closed on concurrent duplicates)
   let proof = null, publicSignals = [];
   let decision = verdict.decision, reason = verdict.reason_code;
   if (reason !== 'PROOF_REUSED') {
@@ -650,7 +651,10 @@ async function handleArena(req, res) {
     return sendRaw(res, 200, preBody, sig);
   }
   const v = validateGatekeeperInput(body);
-  if (!v.ok) return sendSignedArena(res, 400, { error: v.error }, secret);
+  if (!v.ok) {
+    log('ARENA 400', v.error, 'type=', body.type, 'mode=', body.mode, 'keys=', Object.keys(body).join(','), 'body=', raw.toString('utf8').slice(0, 500));
+    return sendSignedArena(res, 400, { error: v.error }, secret);
+  }
   const input = v.input;
   if (arenaCache.has(input.task_id)) {
     const c = arenaCache.get(input.task_id);
