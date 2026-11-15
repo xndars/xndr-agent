@@ -9,7 +9,7 @@ verified, it fails closed and says so — it never calls something safe on hope.
   `0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7` (BSC, chain 56)
 - **Live since:** 29 Oct 2026, in daily use by its owner. 12 free mints verified
   and executed through this exact checking flow (DYOR, Covenant, BAO Oracle,
-  Mars, Zeroling, and others — see `examples/`).
+  Mars, Zeroling, and others — see Verified results below).
 - **Prize track:** Wildcard, 100,000 VFY (50,000 / 30,000 / 20,000).
 
 ## The problem
@@ -53,7 +53,8 @@ the wallet preview must still be read before signing.
 ## Run it
 
 ```bash
-node server.js          # port 8787 (or $PORT). No npm install needed.
+npm install
+node server.js          # port 8787 (or $PORT)
 curl http://127.0.0.1:8787/health
 curl -X POST http://127.0.0.1:8787/check-mint \
   -H 'content-type: application/json' \
@@ -104,6 +105,6 @@ this submission is judged on the working agent, not on a proof it does not have.
 ## Layout
 
 - `server.js` — the whole agent (HTTP + verification logic, no framework)
-- `ethers.umd.min.js` — vendored ethers 6.13.4
-- `examples/` — real outputs from the checks above
+- `package.json` — `ethers@6.13.4` dependency; `npm start` runs the server
+- `render.yaml` — Render Free deploy config (health check `/health`)
 - `README.md`, `LICENSE` (MIT)
