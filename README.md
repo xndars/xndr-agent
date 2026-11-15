@@ -145,7 +145,7 @@ proof 743 bytes JSON, verified with the circuit vk via
   not be caught as reused). Accepted risk for now — no external store.
 - Circuit files are the official ones from
   `agentgames.zkverify.io/circuits` (wasm 1,755,820 bytes, zkey 309,750
-  bytes; sha256 in `scripts/download-circuits.js`). If the platform rotates
+  bytes; sha256 in `download-circuits.js`). If the platform rotates
   the circuit, `npm install` re-downloads only when the files are missing;
   delete `circuits/` and redeploy to pick up a new version.
 - Steal the VFY is NOT implemented: the turn envelope, strategy
@@ -187,7 +187,7 @@ it does not have.
 - `server.js` — the whole agent (HTTP + verification logic + arena mode, no framework)
 - `package.json` — `ethers@6.13.4` + `snarkjs@0.7.6` dependencies; `npm start` runs the server
 - `circuits/` — official Gatekeeper circuit (`gatekeeper.wasm`, `gatekeeper_final.zkey`)
-- `scripts/download-circuits.js` — postinstall fallback: downloads the circuits if missing
+- `download-circuits.js` — postinstall fallback: downloads the circuits if missing
 - `examples/` — real outputs (check-mint / check-wallet / arena valid + traps + test results)
 - `railway.json` — Railway deploy config (health check `/health`)
 - `render.yaml` — Render Free deploy config (health check `/health`)

@@ -33,7 +33,7 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 const RPCS = (process.env.XNDR_RPCS || [
   'https://bsc-rpc.publicnode.com',
@@ -630,6 +630,19 @@ async function handleArena(req, res) {
   try { body = JSON.parse(raw.toString('utf8')); } catch {
     return sendSignedArena(res, 400, { error: 'invalid JSON' }, secret);
   }
+  // Signed preflight / health-check: the platform sends a signed request that
+  // is NOT a Gatekeeper task (different type, or a minimal ping). The
+  // dashboard only requires HTTP 200 for it, so answer it signed and stop.
+  // Anything carrying a task_id + input is a real task and still goes through
+  // full validation below (a malformed real task stays 400).
+  const ptype = typeof body.type === 'string' ? body.type : '';
+  const isPreflight = /preflight|health|ping|probe/i.test(ptype)
+    || body.mode === 'preflight'
+    || (!body.task_id && !body.input);
+  if (isPreflight) {
+    log('ARENA preflight ack', ptype || body.mode || 'ping');
+    return sendSignedArena(res, 200, { ok: true, agent: 'xndr', type: ptype || 'preflight', received_at: new Date().toISOString() }, secret);
+  }
   const v = validateGatekeeperInput(body);
   if (!v.ok) return sendSignedArena(res, 400, { error: v.error }, secret);
   const input = v.input;
@@ -710,7 +723,8 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, agent: 'xndr', chainId: CHAIN_ID, blockNumber: block ? parseInt(block, 16) : null, time: wib(), arena: { enabled: arenaCircuitsReady(), circuits: arenaCircuitsReady(), secretConfigured: Boolean(arenaSecret()), hmacAlgo: arenaHmacConfig().algo } });
     }
     if (req.method === 'GET' && url.pathname === '/agent') {
-      return send(res, 405, { error: 'method not allowed: POST a signed Gatekeeper task envelope here', agent: 'xndr' });
+      // Some health checks are plain GETs: answer 200, never 4xx.
+      return send(res, 200, { ok: true, agent: 'xndr', version: VERSION, arena: { enabled: arenaCircuitsReady(), circuits: arenaCircuitsReady(), secretConfigured: Boolean(arenaSecret()) }, usage: 'POST a signed Gatekeeper task envelope here' });
     }
     if (req.method === 'POST' && (url.pathname === '/agent' || url.pathname === '/')) {
       return handleArena(req, res);
