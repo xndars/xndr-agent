@@ -9,18 +9,18 @@
 - [x] Agent dibangun & diuji: `~/workspace/xndr-agent/` (server.js, Node, tanpa framework)
 - [x] Demo publik (web artifact): sudah jadi, sudah ditampilkan di chat
 - [ ] Demo artifact di-share publik — BUTUH permintaan eksplisit kamu (aturan share)
-- [ ] Repo GitHub publik — BELUM: repo masih lokal, push butuh login GitHub kamu
-- [ ] **Endpoint HTTPS publik — BELUM, INI BLOCKER UTAMA.** Server lokal jalan di port 8787, tapi tunnel trycloudflare GAGAL 2026-11-15 ~04:37 WIB. UPDATE 15 Nov ~08:24 WIB: hosting gratis dipilih = Render Free (750 jam/bulan, tanpa kartu kredit); file deploy `package.json` + `render.yaml` sudah dibuat dan teruji jalan dengan `$PORT` (`/health` ok). Tinggal: repo GitHub publik + connect Render oleh user (login user).
-- [x] Akun Agent Games — SUDAH via X (15 Nov ~08:22 WIB). Handle yang diklaim + link reff user MASIH DITANYAKAN. Jangan daftar lagi — satu akun per peserta, multi-akun = diskualifikasi. WalletConnect wallet-agent tetap gagal, tidak dipakai lagi.
+- [x] Repo GitHub publik — https://github.com/xndars/xndr-agent (publik, branch main, user xndars; terverifikasi 15 Nov ~08:44 WIB)
+- [x] **Endpoint HTTPS publik — LIVE di Railway sejak 15 Nov ~09:03 WIB: https://xndr-agent-production.up.railway.app** — terverifikasi: `/health` ok (blok 133652326), `/check-mint` DYOR → `FREE_GONE` "Sold out", `/check-wallet` BNB 0.000809… + 12/12 NFT. Render DIBATALKAN (minta kartu saat deploy, user tidak mau isi kartu); Railway trial $5/30 hari tanpa kartu. Railway tidak tidur seperti Render Free, jadi TIDAK perlu ping keep-alive.
+- [x] Akun Agent Games — SUDAH via X (15 Nov ~08:22 WIB). Akun tampil sebagai "Kaiden" (nama dari X). Handle xndr BELUM diklaim di mana pun (registrasi agent butuh pilih track arena wajib — dilewati; form submission tidak minta handle). Link reff user MASIH BELUM DIKETAHUI. Wallet agent 0x0Db7… BELUM dimasukkan ke profil (tidak ada menu Profile di dashboard) — perlu dicari jalurnya sebelum klaim hadiah.
 - [ ] Link referral kamu sendiri — baru ada setelah akun jadi
-- [ ] Submit di https://agentgames.zkverify.io/dashboard/submissions?category=wildcard
-  — JANGAN submit sebelum endpoint HTTPS live dicantumkan
+- [x] Submit di https://agentgames.zkverify.io/dashboard/submissions?category=wildcard — BERHASIL 15 Nov ~09:28 WIB (Wildcard, title ASCII "xndr - Verifiable Web3 Safety Agent (read-only)", repo + endpoint Railway live, What It Does ASCII 1738 karakter, Additional Links 3 baris, Message to Judges DIKOSONGKAN, Proof Reference kosong). Pelajaran: form Agent Games MENOLAK karakter em-dash "—" (non-ASCII) — Message to Judges gagal submit karena "—" di "public — please test"; versi ASCII lolos. Endpoint sengaja dikosongkan saat submit pertama? TIDAK — endpoint tetap terisi di percobaan pertama; yang bikin gagal adalah Message to Judges, bukan endpoint.
+- [x] ARENA — Proof Gatekeeper DITAMBAHKAN 15 Nov ~09:45 WIB (server v0.2.0): POST /agent + POST / (root), HMAC-SHA256 header x-agent-games-signature, secret dari env AGENT_GAMES_SECRET, keputusan deterministik 7 trap + reason_code, proof Groth16 snarkjs 0.7.6 dari circuit resmi (circuits/ di repo), idempotency per task_id + seen-set proof_tx (in-memory). Test lokal 19/19 LOLOS (valid APPROVE + proof terverifikasi via snarkjs, 7 trap REJECT benar, HMAC salah 401, retry identik, respons <1,1 detik; contoh di examples/arena-*.json). BELUM DIREGISTRASI: pendaftaran agent butuh login user (centang Proof Gatekeeper) + secret HMAC 32-byte dari dashboard (tampil SATU KALI) yang harus diisi ke Railway Variables AGENT_GAMES_SECRET. Ronde Gatekeeper 13-20 Nov, 8 ronde/hari 17:30-03:30 WIB; Round 3 mulai 15 Nov 17:30 WIB — daftar + practice SEBELUM itu. Steal the VFY TIDAK DIBANGUN (spesifikasi envelope/strategi tidak ditemukan di sumber publik).
 
 ## 1. AGENT LINK (isi saat submit)
 
-- Public repository: (belum — push repo ke GitHub dulu)
+- Public repository: https://github.com/xndars/xndr-agent
 - Public demo: (link share artifact `xndr` — minta share dulu)
-- Public endpoint: (URL HTTPS endpoint — WAJIB live sebelum submit)
+- Public endpoint: https://xndr-agent-production.up.railway.app
 
 ## 2. USE CASE (copy-ready, English)
 

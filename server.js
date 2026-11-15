@@ -9,24 +9,31 @@
  *
  * Endpoints (all JSON, BSC chain 56 only):
  *   GET  /            agent card
- *   GET  /health      liveness + latest block
+ *   GET  /health      liveness + latest block (+ arena readiness)
  *   POST /check-mint  { contract, wallet?, quantity? }  — free-mint verification
  *   POST /check-wallet { wallet, tokens?, nfts? }        — balances + ownership
  *   POST /check-approval { wallet, contract, tokenId?, operator }
+ *   POST /agent       Proof Gatekeeper arena task (HMAC-signed envelope, see ARENA section)
+ *   POST /            same as POST /agent (root also accepts arena tasks)
  *
  * Run:  node server.js            (port 8787, or $PORT)
- * Dependencies: run `npm install` once (fetches ethers@6.13.4).
- * ethers@6.13.4 via npm.
+ * Dependencies: run `npm install` once (fetches ethers@6.13.4 + snarkjs@0.7.6).
+ * ethers@6.13.4 via npm. Arena proofs: snarkjs 0.7.6 + official circuit files in circuits/.
  */
 const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { ethers } = require('ethers');
+let snarkjs = null;
+try { snarkjs = require('snarkjs'); } catch { snarkjs = null; /* arena proofs unavailable; read-only endpoints keep working */ }
 
 const PORT = Number(process.env.PORT || 8787);
 const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 const RPCS = (process.env.XNDR_RPCS || [
   'https://bsc-rpc.publicnode.com',
@@ -408,11 +415,263 @@ async function checkApproval(walletRaw, contractRaw, tokenId, operatorRaw) {
   return out;
 }
 
+// ---------- ARENA — Proof Gatekeeper (Agent Games) ----------
+// Accepts signed task envelopes at POST /agent and POST / (root). This mode
+// never touches the wallet: it only decides APPROVE/REJECT on a payment-gate
+// task and proves the decision with the tournament's own Groth16 circuit.
+// Fail closed everywhere: bad signature, malformed task, missing circuits,
+// or an unprovable approval all end in REJECT (or 4xx), never in a guess.
+//
+// Sources: agentgames.zkverify.io (event page, /api/circuit-info) + the
+// builder field guide + participant write-ups (Medium, Nov 2026).
+// CONFIRMED: envelope shape, 7 traps + reason codes, response shape,
+// header x-agent-games-signature, secret shown ONCE at agent registration,
+// circuit files + vkHash 0x6b79c6…d77b0, snarkjs 0.7.6, proof ~3s.
+// NOT CONFIRMED officially: the HMAC algorithm (suspected SHA256) and the
+// exact taskId->field mapping. Defaults below are the safest guesses and
+// every one of them is overridable by env (see README Arena section).
+// If practice-mode tasks come back 401, flip AGENT_GAMES_SECRET_ENCODING
+// (utf8/hex/base64) or AGENT_GAMES_HMAC_ALGO first.
+const FIELD_P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n; // BN254 scalar field
+const CIRCUIT_DIR = path.join(__dirname, 'circuits');
+const GATEKEEPER_WASM = path.join(CIRCUIT_DIR, 'gatekeeper.wasm');
+const GATEKEEPER_ZKEY = path.join(CIRCUIT_DIR, 'gatekeeper_final.zkey');
+// Registered verification-key hash, from https://agentgames.zkverify.io/api/circuit-info
+// (informational: the decision compares proof_vk against the task's registered_vk).
+const REGISTERED_VK_HASH = '0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0';
+const ARENA_HMAC_HEADER = 'x-agent-games-signature';
+
+function arenaHmacConfig() {
+  return {
+    algo: (process.env.AGENT_GAMES_HMAC_ALGO || 'sha256').toLowerCase(),
+    encoding: (process.env.AGENT_GAMES_HMAC_ENCODING || 'hex').toLowerCase(),
+    secretEncoding: (process.env.AGENT_GAMES_SECRET_ENCODING || 'utf8').toLowerCase(),
+  };
+}
+function arenaSecret() { const s = (process.env.AGENT_GAMES_SECRET || '').trim(); return s || null; }
+function arenaCircuitsReady() {
+  return Boolean(snarkjs) && fs.existsSync(GATEKEEPER_WASM) && fs.existsSync(GATEKEEPER_ZKEY);
+}
+function hmacKeyBytes(secret, secretEncoding) {
+  if (secretEncoding === 'hex') return Buffer.from(secret, 'hex');
+  if (secretEncoding === 'base64') return Buffer.from(secret, 'base64');
+  return Buffer.from(secret, 'utf8');
+}
+function hmacSign(secret, rawBody) {
+  const cfg = arenaHmacConfig();
+  const h = crypto.createHmac(cfg.algo, hmacKeyBytes(secret, cfg.secretEncoding));
+  h.update(rawBody);
+  return cfg.encoding === 'base64' ? h.digest('base64') : h.digest('hex');
+}
+function hmacVerify(secret, rawBody, sigHeader) {
+  if (!sigHeader) return false;
+  let sig = String(sigHeader).trim();
+  for (const p of ['sha256=', 'hmac-sha256=', 'hmac=']) {
+    if (sig.toLowerCase().startsWith(p)) { sig = sig.slice(p.length); break; }
+  }
+  let expected;
+  try { expected = hmacSign(secret, rawBody); } catch { return false; }
+  const a = Buffer.from(sig, 'utf8'), b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+}
+function hexToField(h) {
+  const s = String(h).trim();
+  if (!/^0x[0-9a-fA-F]+$/.test(s)) throw new Error('not hex');
+  return (BigInt(s) % FIELD_P).toString();
+}
+function taskIdToField(taskId) {
+  // ASSUMPTION (not documented officially): map the string task id to a field
+  // element via keccak256(task_id) mod p. If the platform expects a different
+  // mapping, the proof's public signals won't match its expectation — the
+  // decision + reason_code are still scored independently.
+  const hash = ethers.keccak256(ethers.toUtf8Bytes(String(taskId)));
+  return (BigInt(hash) % FIELD_P).toString();
+}
+function randomSalt() {
+  return (BigInt('0x' + crypto.randomBytes(31).toString('hex')) % FIELD_P).toString();
+}
+
+// Deterministic decision. Check order is deliberate: reuse first (no proof
+// may be minted for a spent reference), then the cheap field checks.
+function decideGatekeeper(input, seenProofs) {
+  const norm = s => String(s).toLowerCase();
+  if (seenProofs.has(norm(input.proof_tx))) return { decision: 'REJECT', reason_code: 'PROOF_REUSED' };
+  if (norm(input.proof_vk) !== norm(input.registered_vk)) return { decision: 'REJECT', reason_code: 'VK_SUBSTITUTION' };
+  if (BigInt(input.public_balance) < BigInt(input.minimum)) return { decision: 'REJECT', reason_code: 'THRESHOLD_MISMATCH' };
+  if (Number(input.current_block) >= Number(input.expiry_block)) return { decision: 'REJECT', reason_code: 'EXPIRED_CONDITION' };
+  if (norm(input.recipient) !== norm(input.condition_recipient)) return { decision: 'REJECT', reason_code: 'RECIPIENT_MISMATCH' };
+  if (BigInt(input.amount) > BigInt(input.max_transfer)) return { decision: 'REJECT', reason_code: 'AMOUNT_OVERFLOW' };
+  return { decision: 'APPROVE', reason_code: 'VALID_CONDITION' };
+}
+
+function validateGatekeeperInput(body) {
+  const bad = error => ({ ok: false, error });
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('envelope must be a JSON object');
+  if (body.type && body.type !== 'agent-games.proof-gatekeeper.v1') return bad('unsupported envelope type');
+  const input = body.input && typeof body.input === 'object' ? body.input : body;
+  const task_id = body.task_id || input.task_id;
+  if (!task_id || typeof task_id !== 'string') return bad('task_id is required');
+  const isHex = (s, len) => typeof s === 'string' && new RegExp(len ? `^0x[0-9a-fA-F]{${len}}$` : '^0x[0-9a-fA-F]+$').test(s);
+  const isDec = s => /^-?\d+$/.test(String(s));
+  const isInt = s => Number.isInteger(Number(s)) && Number(s) >= 0 && String(s).trim() !== '';
+  for (const f of ['registered_vk', 'proof_vk']) if (!isHex(input[f])) return bad(`${f} must be a 0x hex string`);
+  for (const f of ['minimum', 'public_balance', 'amount', 'max_transfer']) if (!isDec(input[f])) return bad(`${f} must be a decimal integer string`);
+  for (const f of ['expiry_block', 'current_block']) if (!isInt(input[f])) return bad(`${f} must be a non-negative integer`);
+  for (const f of ['recipient', 'condition_recipient']) if (!isAddr(input[f])) return bad(`${f} must be a valid 0x address`);
+  if (!isHex(input.proof_tx, 64)) return bad('proof_tx must be a 0x 64-hex string');
+  return {
+    ok: true,
+    input: {
+      task_id: String(task_id),
+      registered_vk: String(input.registered_vk),
+      proof_vk: String(input.proof_vk),
+      minimum: String(input.minimum),
+      public_balance: String(input.public_balance),
+      expiry_block: Number(input.expiry_block),
+      current_block: Number(input.current_block),
+      recipient: ethers.getAddress(input.recipient),
+      condition_recipient: ethers.getAddress(input.condition_recipient),
+      amount: String(input.amount),
+      max_transfer: String(input.max_transfer),
+      proof_tx: String(input.proof_tx).toLowerCase(),
+    },
+  };
+}
+
+let arenaVkCache = null;
+async function arenaGetVk() {
+  if (!arenaVkCache) arenaVkCache = await snarkjs.zKey.exportVerificationKey(GATEKEEPER_ZKEY);
+  return arenaVkCache;
+}
+// Returns { proof, publicSignals } or null. Null means: no circuits, proof
+// generation failed, local verification failed, or the 50s safety budget ran out.
+async function arenaProve(input, decision) {
+  if (!arenaCircuitsReady()) return null;
+  const circuitInput = {
+    registeredVkHash: hexToField(input.registered_vk),
+    proofVkHash: hexToField(input.proof_vk),
+    minimum: BigInt(input.minimum).toString(),
+    publicBalance: BigInt(input.public_balance).toString(),
+    expiryBlock: String(input.expiry_block),
+    currentBlock: String(input.current_block),
+    recipient: hexToField(input.recipient),
+    conditionRecipient: hexToField(input.condition_recipient),
+    amount: BigInt(input.amount).toString(),
+    maxTransfer: BigInt(input.max_transfer).toString(),
+    decision: decision === 'APPROVE' ? '1' : '0',
+    taskId: taskIdToField(input.task_id),
+    salt: randomSalt(),
+  };
+  const proveP = (async () => {
+    const { proof, publicSignals } = await snarkjs.groth16.fullProve(circuitInput, GATEKEEPER_WASM, GATEKEEPER_ZKEY);
+    const vk = await arenaGetVk();
+    const ok = await snarkjs.groth16.verify(vk, publicSignals, proof);
+    return ok ? { proof, publicSignals } : null;
+  })().catch(() => null);
+  const raced = await Promise.race([proveP, sleep(50000).then(() => 'TIMEOUT')]);
+  return raced === 'TIMEOUT' ? null : raced;
+}
+
+const arenaCache = new Map(); // task_id -> { status, body, signature } (byte-identical retries)
+const arenaInflight = new Map(); // task_id -> Promise (a retry during proving waits, never poisons the cache)
+const arenaSeenProofs = new Set(); // normalized proof_tx (in-memory; lost on restart — see README)
+
+async function arenaProcess(input) {
+  const started = Date.now();
+  const secret = arenaSecret();
+  const verdict = decideGatekeeper(input, arenaSeenProofs);
+  arenaSeenProofs.add(input.proof_tx); // record before the proving await (fail closed on concurrent duplicates)
+  let proof = null, publicSignals = [];
+  let decision = verdict.decision, reason = verdict.reason_code;
+  if (reason !== 'PROOF_REUSED') {
+    let p = null;
+    try { p = await arenaProve(input, decision); } catch { p = null; }
+    if (p) { proof = p.proof; publicSignals = p.publicSignals; }
+    else if (decision === 'APPROVE') {
+      // The circuit refused to prove an approval: fail closed. The most
+      // likely circuit-side mismatch is the vk binding.
+      decision = 'REJECT'; reason = 'VK_SUBSTITUTION';
+    }
+    // A REJECT without a proof is still a valid response (decision + reason are scored).
+  }
+  const out = { decision, reason_code: reason, proof_tx: input.proof_tx, proof, public_signals: publicSignals };
+  const respBody = JSON.stringify(out);
+  let sig = null;
+  try { sig = hmacSign(secret, Buffer.from(respBody, 'utf8')); } catch { sig = null; }
+  const result = { status: 200, body: respBody, signature: sig };
+  arenaCache.set(input.task_id, result);
+  log(`ARENA ${input.task_id} ${decision} ${reason} ${Date.now() - started}ms proof=${proof ? 'yes' : 'no'}`);
+  return result;
+}
+
+function sendSignedArena(res, code, obj, secret) {
+  const body = JSON.stringify(obj);
+  let sig = null;
+  if (secret) { try { sig = hmacSign(secret, Buffer.from(body, 'utf8')); } catch { sig = null; } }
+  return sendRaw(res, code, body, sig);
+}
+
+async function handleArena(req, res) {
+  const secret = arenaSecret();
+  if (!secret) {
+    log('ARENA 401 no secret configured');
+    return sendRaw(res, 401, JSON.stringify({ error: 'agent games secret not configured' }), null);
+  }
+  let raw;
+  try { raw = await readRawBody(req); } catch {
+    return sendSignedArena(res, 413, { error: 'body too large' }, secret);
+  }
+  if (!hmacVerify(secret, raw, req.headers[ARENA_HMAC_HEADER])) {
+    log('ARENA 401 bad signature');
+    return sendSignedArena(res, 401, { error: 'bad signature' }, secret);
+  }
+  let body;
+  try { body = JSON.parse(raw.toString('utf8')); } catch {
+    return sendSignedArena(res, 400, { error: 'invalid JSON' }, secret);
+  }
+  const v = validateGatekeeperInput(body);
+  if (!v.ok) return sendSignedArena(res, 400, { error: v.error }, secret);
+  const input = v.input;
+  if (arenaCache.has(input.task_id)) {
+    const c = arenaCache.get(input.task_id);
+    log(`ARENA replay ${input.task_id} -> cached`);
+    return sendRaw(res, c.status, c.body, c.signature);
+  }
+  if (arenaInflight.has(input.task_id)) {
+    const c = await arenaInflight.get(input.task_id);
+    return sendRaw(res, c.status, c.body, c.signature);
+  }
+  const work = arenaProcess(input);
+  arenaInflight.set(input.task_id, work);
+  try {
+    const c = await work;
+    return sendRaw(res, c.status, c.body, c.signature);
+  } finally {
+    arenaInflight.delete(input.task_id);
+  }
+}
+
 // ---------- HTTP ----------
 function send(res, code, obj) {
   const body = JSON.stringify(obj, null, 2);
   res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type' });
   res.end(body);
+}
+// Raw-body send (arena): byte-exact body + optional HMAC signature header.
+function sendRaw(res, code, body, signature) {
+  const headers = { 'content-type': 'application/json', 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type, x-agent-games-signature' };
+  if (signature) headers[ARENA_HMAC_HEADER] = signature;
+  res.writeHead(code, headers);
+  res.end(body);
+}
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', c => { size += c.length; if (size > 65536) { reject(new Error('body too large')); req.destroy(); } else chunks.push(c); });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -441,14 +700,20 @@ const server = http.createServer(async (req, res) => {
         agent: 'xndr', handle: 'xndr.ai', version: VERSION, chainId: CHAIN_ID,
         wallet: AGENT_WALLET, registry: AGENT_REGISTRY,
         what: 'Read-only Web3 safety agent: verifies a mint/approval/wallet on-chain before anyone signs. Never signs, never broadcasts, never holds a private key.',
-        capabilities: ['POST /check-mint — verify a free mint (code, identity, mint fns, value-0 simulation)', 'POST /check-wallet — BNB/token balances + NFT ownership', 'POST /check-approval — operator / per-token approvals', 'GET /health — liveness + block'],
+        capabilities: ['POST /check-mint — verify a free mint (code, identity, mint fns, value-0 simulation)', 'POST /check-wallet — BNB/token balances + NFT ownership', 'POST /check-approval — operator / per-token approvals', 'GET /health — liveness + block', 'POST /agent — Proof Gatekeeper arena task (HMAC-signed envelope, Groth16 proof)'],
         limits: ['BSC (chain 56) only', 'read-only: no signing, no broadcast, no state change', 'fail-closed: unverifiable means DO NOT SIGN', 'free-mint verdicts are simulations, not guarantees'],
         evidence: { bscscan: `https://bscscan.com/address/${AGENT_WALLET}`, registry: `https://bscscan.com/address/${AGENT_REGISTRY}` },
       });
     }
     if (req.method === 'GET' && url.pathname === '/health') {
       const block = await withTimeout(rpc('eth_blockNumber', []), 10000).catch(() => null);
-      return send(res, 200, { ok: true, agent: 'xndr', chainId: CHAIN_ID, blockNumber: block ? parseInt(block, 16) : null, time: wib() });
+      return send(res, 200, { ok: true, agent: 'xndr', chainId: CHAIN_ID, blockNumber: block ? parseInt(block, 16) : null, time: wib(), arena: { enabled: arenaCircuitsReady(), circuits: arenaCircuitsReady(), secretConfigured: Boolean(arenaSecret()), hmacAlgo: arenaHmacConfig().algo } });
+    }
+    if (req.method === 'GET' && url.pathname === '/agent') {
+      return send(res, 405, { error: 'method not allowed: POST a signed Gatekeeper task envelope here', agent: 'xndr' });
+    }
+    if (req.method === 'POST' && (url.pathname === '/agent' || url.pathname === '/')) {
+      return handleArena(req, res);
     }
     if (req.method === 'POST' && ['/check-mint', '/check-wallet', '/check-approval'].includes(url.pathname)) {
       const body = await readBody(req);
@@ -468,12 +733,12 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, out);
       }
     }
-    return send(res, 404, { error: 'not found', routes: ['GET /', 'GET /health', 'POST /check-mint', 'POST /check-wallet', 'POST /check-approval'] });
+    return send(res, 404, { error: 'not found', routes: ['GET /', 'GET /health', 'POST /check-mint', 'POST /check-wallet', 'POST /check-approval', 'POST /agent — Proof Gatekeeper arena task (HMAC-signed)'] });
   } catch (e) {
     log('ERR', req.method, url.pathname, e.message);
     return send(res, e.code === 504 ? 504 : 500, { error: e.message.slice(0, 200), agent: 'xndr' });
   }
 });
 
-server.listen(PORT, () => log(`xndr v${VERSION} listening on :${PORT} — read-only, BSC 56, no keys, no signing`));
+server.listen(PORT, () => log(`xndr v${VERSION} listening on :${PORT} — read-only, BSC 56, no keys, no signing — arena: ${arenaCircuitsReady() ? 'ready' : 'NO CIRCUITS'}, secret: ${arenaSecret() ? 'set' : 'NOT SET'}`));
 module.exports = { server };
