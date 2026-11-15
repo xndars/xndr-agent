@@ -33,7 +33,19 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
+
+// Deterministic UUIDv5 (RFC 4122) — the platform requires idempotencyKey to
+// be a UUID, and retries must get a byte-identical response, so the key is
+// derived from matchId+turn (never random).
+function uuidV5(name, namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8') {
+  const ns = Buffer.from(namespace.replace(/-/g, ''), 'hex');
+  const hash = crypto.createHash('sha1').update(Buffer.concat([ns, Buffer.from(name, 'utf8')])).digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50; // version 5
+  hash[8] = (hash[8] & 0x3f) | 0x80; // variant RFC 4122
+  const hex = hash.subarray(0, 16).toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
 
 const RPCS = (process.env.XNDR_RPCS || [
   'https://bsc-rpc.publicnode.com',
@@ -575,6 +587,7 @@ async function arenaProve(input, decision) {
 }
 
 const arenaCache = new Map(); // task_id -> { status, body, signature } (byte-identical retries)
+const stealCache = new Map(); // matchId:turn -> { status, body, signature } (byte-identical retries)
 const arenaInflight = new Map(); // task_id -> Promise (a retry during proving waits, never poisons the cache)
 const arenaSeenProofs = new Set(); // normalized proof_tx (in-memory; lost on restart — see README)
 
@@ -660,14 +673,32 @@ async function handleArena(req, res) {
     const matchId = String(body.matchId || body.match_id);
     const turn = Number(body.turn ?? body.turn_number ?? 1);
     log('STEAL turn', matchId, 'turn', turn, 'keys=', Object.keys(body).join(','), 'body=', raw.toString('utf8').slice(0, 2000));
-    return sendSignedArena(res, 200, {
+    // Idempotency: retries of the same (matchId, turn) must get the
+    // byte-identical cached response (same agentTimestamp, same key).
+    const stealKey = `${matchId}:${turn}`;
+    if (stealCache.has(stealKey)) {
+      const c = stealCache.get(stealKey);
+      log(`STEAL replay ${stealKey} -> cached`);
+      return sendRaw(res, c.status, c.body, c.signature);
+    }
+    // policyProof fields per practice diagnostic 2026-11-15 10:35 WIB:
+    // circuitVersion + publicInputsHash are required strings. The hash below
+    // is a PLACEHOLDER (keccak of match/turn/action) until the real
+    // public-inputs formula is known from the turn request JSON; the real
+    // Groth16 proof via the vfy-policy circuit is still TBD.
+    const publicInputsHash = ethers.keccak256(ethers.toUtf8Bytes(JSON.stringify({ matchId, turn, action: 'HOLD' })));
+    const out = {
       matchId,
       turn,
       action: { type: 'HOLD' },
-      policyProof: {},
+      policyProof: { circuitVersion: 'v1', publicInputsHash },
       agentTimestamp: new Date().toISOString(),
-      idempotencyKey: `${matchId}:${turn}`,
-    }, secret);
+      idempotencyKey: uuidV5(stealKey),
+    };
+    const outRaw = Buffer.from(JSON.stringify(out), 'utf8');
+    const sig = hmacSign(secret, outRaw);
+    stealCache.set(stealKey, { status: 200, body: outRaw, signature: sig });
+    return sendRaw(res, 200, outRaw, sig);
   }
 
   const v = validateGatekeeperInput(body);
