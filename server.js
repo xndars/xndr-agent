@@ -640,8 +640,14 @@ async function handleArena(req, res) {
     || body.mode === 'preflight'
     || (!body.task_id && !body.input);
   if (isPreflight) {
+    // The platform's preflight expects EXACTLY this body (diagnostic
+    // 2026-11-15 10:11 WIB): {"ok":true,"protocolVersion":"v1"}, signed
+    // with the HMAC secret. Any other shape fails protocol validation.
     log('ARENA preflight ack', ptype || body.mode || 'ping');
-    return sendSignedArena(res, 200, { ok: true, agent: 'xndr', type: ptype || 'preflight', received_at: new Date().toISOString() }, secret);
+    const preBody = '{"ok":true,"protocolVersion":"v1"}';
+    let sig = null;
+    try { sig = hmacSign(secret, Buffer.from(preBody, 'utf8')); } catch { sig = null; }
+    return sendRaw(res, 200, preBody, sig);
   }
   const v = validateGatekeeperInput(body);
   if (!v.ok) return sendSignedArena(res, 400, { error: v.error }, secret);
