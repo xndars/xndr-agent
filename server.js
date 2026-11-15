@@ -33,7 +33,7 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 
 const RPCS = (process.env.XNDR_RPCS || [
   'https://bsc-rpc.publicnode.com',
@@ -637,9 +637,10 @@ async function handleArena(req, res) {
   // Anything carrying a task_id + input is a real task and still goes through
   // full validation below (a malformed real task stays 400).
   const ptype = typeof body.type === 'string' ? body.type : '';
+  const hasMatch = body.matchId || body.match_id;
   const isPreflight = /preflight|health|ping|probe/i.test(ptype)
     || body.mode === 'preflight'
-    || (!body.task_id && !body.input);
+    || (!body.task_id && !body.input && !hasMatch);
   if (isPreflight) {
     // The platform's preflight expects EXACTLY this body (diagnostic
     // 2026-11-15 10:11 WIB): {"ok":true,"protocolVersion":"v1"}, signed
@@ -650,6 +651,25 @@ async function handleArena(req, res) {
     try { sig = hmacSign(secret, Buffer.from(preBody, 'utf8')); } catch { sig = null; }
     return sendRaw(res, 200, preBody, sig);
   }
+  // Steal the VFY turn (2026-11-15: envelope has matchId/turn, no task_id).
+  // Response schema per practice diagnostic: matchId, turn, action,
+  // policyProof, agentTimestamp, idempotencyKey. The full request is logged
+  // (Railway logs) so the turn state fields can be mapped; the policy proof
+  // needs the vfy-policy circuit and the strategy commitment, still TBD.
+  if (hasMatch) {
+    const matchId = String(body.matchId || body.match_id);
+    const turn = Number(body.turn ?? body.turn_number ?? 1);
+    log('STEAL turn', matchId, 'turn', turn, 'keys=', Object.keys(body).join(','), 'body=', raw.toString('utf8').slice(0, 2000));
+    return sendSignedArena(res, 200, {
+      matchId,
+      turn,
+      action: { type: 'HOLD' },
+      policyProof: {},
+      agentTimestamp: new Date().toISOString(),
+      idempotencyKey: `${matchId}:${turn}`,
+    }, secret);
+  }
+
   const v = validateGatekeeperInput(body);
   if (!v.ok) {
     log('ARENA 400', v.error, 'type=', body.type, 'mode=', body.mode, 'keys=', Object.keys(body).join(','), 'body=', raw.toString('utf8').slice(0, 500));
