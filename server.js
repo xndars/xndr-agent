@@ -33,7 +33,7 @@ const CHAIN_ID = 56;
 const AGENT_WALLET = '0x0Db7898eecAB03b4fb10C7a985dCD47A3432d8D7';
 const AGENT_HANDLE = 'xndr';
 const AGENT_REGISTRY = '0x60B9262456dE011F7d15a54CdD8c48bAaa8B022F';
-const VERSION = '0.2.5';
+const VERSION = '0.2.6';
 
 // Deterministic UUIDv5 (RFC 4122) — the platform requires idempotencyKey to
 // be a UUID, and retries must get a byte-identical response, so the key is
@@ -504,6 +504,19 @@ function randomSalt() {
   return (BigInt('0x' + crypto.randomBytes(31).toString('hex')) % FIELD_P).toString();
 }
 
+// Short hash of a normalized proof_tx, for logs/results ONLY — the raw value
+// is never logged. Lets a PROOF_REUSED task be paired with the earlier task
+// that first consumed the same proof_tx (seen 3 rounds in a row, R4-R6:
+// a trap/REJECT task can spend a proof_tx a later valid task needs).
+// Logging-only: does not change any decision.
+function proofTxHash(ptx) {
+  try {
+    const s = String(ptx || '').toLowerCase().trim();
+    if (!s) return null;
+    return ethers.keccak256(ethers.toUtf8Bytes(s)).slice(2, 14); // 12 hex chars
+  } catch { return null; }
+}
+
 // Deterministic decision. Check order is deliberate: reuse first (no proof
 // may be minted for a spent reference), then the cheap field checks.
 // Fail closed: any value that cannot be parsed or verified counts as a
@@ -598,6 +611,7 @@ function recordArenaResult(input, decision, reason, proof, ms) {
       time: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Jakarta', hour12: false }),
       task_id: input.task_id,
       decision, reason_code: reason, proof: Boolean(proof), ms,
+      proof_tx_hash: proofTxHash(input.proof_tx),
       checks: {
         vkMatch: Boolean(input.registered_vk && input.proof_vk && norm(input.proof_vk) === norm(input.registered_vk)),
         thresholdOk: input.public_balance !== null && input.minimum !== null && input.public_balance >= input.minimum,
@@ -634,7 +648,8 @@ async function arenaProcess(input) {
   try { sig = hmacSign(secret, Buffer.from(respBody, 'utf8')); } catch { sig = null; }
   const result = { status: 200, body: respBody, signature: sig };
   arenaCache.set(input.task_id, result);
-  log(`ARENA ${input.task_id} ${decision} ${reason} ${Date.now() - started}ms proof=${proof ? 'yes' : 'no'}`);
+  const ptx = proofTxHash(input.proof_tx);
+  log(`ARENA ${input.task_id} ${decision} ${reason} ${Date.now() - started}ms proof=${proof ? 'yes' : 'no'}${ptx ? ` ptx=${ptx}` : ''}`);
   recordArenaResult(input, decision, reason, proof, Date.now() - started);
   return result;
 }
